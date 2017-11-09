@@ -2,7 +2,7 @@
 
 ----
 ## Requirements
-1. Use Unity 2017.2 beta
+1. Use Unity 2017.2+
 2. Import ARCore SDK [link](https://developers.google.com/ar/develop/unity/getting-started)
 
 
