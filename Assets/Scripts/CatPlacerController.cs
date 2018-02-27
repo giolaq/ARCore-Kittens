@@ -16,8 +16,12 @@ public class CatPlacerController : MonoBehaviour
 	/// </summary>
 	public GameObject m_trackedPlanePrefab;
 
-	private List<TrackedPlane> m_newPlanes = new List<TrackedPlane>();
+    private List<TrackedPlane> m_NewPlanes = new List<TrackedPlane>();
 
+    /// <summary>
+    /// True if the app is in the process of quitting due to an ARCore connection error, otherwise false.
+    /// </summary>
+    private bool m_IsQuitting = false;
 
     /// <summary>
     /// Our cat to place when a raycast from a user touch hits a plane.
@@ -29,31 +33,33 @@ public class CatPlacerController : MonoBehaviour
 	/// </summary>
 	public void Update()
 	{
+        if (Input.GetKey(KeyCode.Escape))
+        {
+            Application.Quit();
+        }
+
 		_QuitOnConnectionErrors();
+       
+        // Check that motion tracking is tracking.
+        if (Session.Status != SessionStatus.Tracking)
+        {
+            const int lostTrackingSleepTimeout = 15;
+            Screen.sleepTimeout = lostTrackingSleepTimeout;
+            return;
+        }
 
-		// The tracking state must be FrameTrackingState.Tracking in order to access the Frame.
-		if (Frame.TrackingState != FrameTrackingState.Tracking)
-		{
-			const int LOST_TRACKING_SLEEP_TIMEOUT = 15;
-			Screen.sleepTimeout = LOST_TRACKING_SLEEP_TIMEOUT;
-			return;
-		}
-
-		Screen.sleepTimeout = SleepTimeout.NeverSleep;
-		Frame.GetNewPlanes(ref m_newPlanes);
+        Screen.sleepTimeout = SleepTimeout.NeverSleep;
 
 		// Iterate over planes found in this frame and instantiate corresponding GameObjects to visualize them.
-		for (int i = 0; i < m_newPlanes.Count; i++)
+        Session.GetTrackables<TrackedPlane>(m_NewPlanes, TrackableQueryFilter.New);
+        for (int i = 0; i < m_NewPlanes.Count; i++)
 		{
 			// Instantiate a plane visualization prefab and set it to track the new plane. The transform is set to
 			// the origin with an identity rotation since the mesh for our prefab is updated in Unity World
 			// coordinates.
 			GameObject planeObject = Instantiate(m_trackedPlanePrefab, Vector3.zero, Quaternion.identity,
 				transform);
-            planeObject.GetComponent<CatPlaneVisualizer>().SetTrackedPlane(m_newPlanes[i]);
-
-			// Apply a random grid rotation.
-			planeObject.GetComponent<Renderer>().material.SetFloat("_UvRotation", Random.Range(0.0f, 360.0f));
+            planeObject.GetComponent<CatPlaneVisualizer>().Initialize(m_NewPlanes[i]);
 		}
 
 
@@ -64,28 +70,33 @@ public class CatPlacerController : MonoBehaviour
 		}
 
 		TrackableHit hit;
-		TrackableHitFlag raycastFilter = TrackableHitFlag.PlaneWithinBounds | TrackableHitFlag.PlaneWithinPolygon;
+        TrackableHitFlags raycastFilter = TrackableHitFlags.PlaneWithinPolygon |
+        TrackableHitFlags.FeaturePointWithSurfaceNormal;
 
-		if (Session.Raycast(m_firstPersonCamera.ScreenPointToRay(touch.position), raycastFilter, out hit))
-		{
-			// Create an anchor to allow ARCore to track the hitpoint as understanding of the physical
-			// world evolves.
-			var anchor = Session.CreateAnchor(hit.Point, Quaternion.identity);
+        if (Frame.Raycast(touch.position.x, touch.position.y, raycastFilter, out hit))
+        {
+            // Create an anchor to allow ARCore to track the hitpoint as understanding of the physical
+            // world evolves.
+            var anchor = hit.Trackable.CreateAnchor(hit.Pose);
 
-			// Intantiate our cat t as a child of the anchor; it's transform will now benefit
-			// from the anchor's tracking.
-            var catObject = Instantiate(kittenPrefab, hit.Point, Quaternion.identity,
-				anchor.transform);
+            // Intantiate our cat as a child of the anchor; it's transform will now benefit
+            // from the anchor's tracking.
+            var catObject = Instantiate(kittenPrefab, hit.Pose.position, hit.Pose.rotation);
 
-			// Oure Kitten should look at the camera but still be flush with the plane.
-			catObject.transform.LookAt(m_firstPersonCamera.transform);
-			catObject.transform.rotation = Quaternion.Euler(0.0f,
-				catObject.transform.rotation.eulerAngles.y, catObject.transform.rotation.z);
+            // Our Kitten should look at the camera but still be flush with the plane.
+            if ((hit.Flags & TrackableHitFlags.PlaneWithinPolygon) != TrackableHitFlags.None)
+            {
+                // Get the camera position and match the y-component with the hit position.
+                Vector3 cameraPositionSameY = m_firstPersonCamera.transform.position;
+                cameraPositionSameY.y = hit.Pose.position.y;
 
-			// Use a plane attachment component to maintain Andy's y-offset from the plane
-			// (occurs after anchor updates).
-			catObject.GetComponent<PlaneAttachment>().Attach(hit.Plane);
-		}
+                // Have Andy look toward the camera respecting his "up" perspective, which may be from ceiling.
+                catObject.transform.LookAt(cameraPositionSameY, catObject.transform.up);
+            }
+
+            // Make Andy model a child of the anchor.
+            catObject.transform.parent = anchor.transform;
+        }
 	}
 
 	/// <summary>
@@ -93,29 +104,38 @@ public class CatPlacerController : MonoBehaviour
 	/// </summary>
 	private void _QuitOnConnectionErrors()
 	{
-		// Do not update if ARCore is not tracking.
-		if (Session.ConnectionState == SessionConnectionState.DeviceNotSupported)
-		{
-			_ShowAndroidToastMessage("This device does not support ARCore.");
-			Application.Quit();
-		}
-		else if (Session.ConnectionState == SessionConnectionState.UserRejectedNeededPermission)
-		{
-			_ShowAndroidToastMessage("Camera permission is needed to run this application.");
-			Application.Quit();
-		}
-		else if (Session.ConnectionState == SessionConnectionState.ConnectToServiceFailed)
-		{
-			_ShowAndroidToastMessage("ARCore encountered a problem connecting.  Please start the app again.");
-			Application.Quit();
-		}
+        if (m_IsQuitting)
+        {
+            return;
+        }
+
+        // Quit if ARCore was unable to connect and give Unity some time for the toast to appear.
+        if (Session.Status == SessionStatus.ErrorPermissionNotGranted)
+        {
+            _ShowAndroidToastMessage("Camera permission is needed to run this application.");
+            m_IsQuitting = true;
+            Invoke("_DoQuit", 0.5f);
+        }
+        else if (Session.Status.IsError())
+        {
+            _ShowAndroidToastMessage("ARCore encountered a problem connecting.  Please start the app again.");
+            m_IsQuitting = true;
+            Invoke("_DoQuit", 0.5f);
+        }
 	}
+
+    /// <summary>
+    /// Actually quit the application.
+    /// </summary>
+    private void _DoQuit()
+    {
+        Application.Quit();
+    }
 
 	/// <summary>
 	/// Show an Android toast message.
 	/// </summary>
 	/// <param name="message">Message string to show in the toast.</param>
-	/// <param name="length">Toast message time length.</param>
 	private static void _ShowAndroidToastMessage(string message)
 	{
 		AndroidJavaClass unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer");
